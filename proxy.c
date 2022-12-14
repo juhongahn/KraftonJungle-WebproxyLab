@@ -8,36 +8,61 @@
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
 static const char *conn_hdr = "Connection: close\r\n";
 static const char *prox_hdr = "Proxy-Connection: close\r\n";
+sem_t mutex, w;
+typedef struct
+{
+	char *buf;
+	char *uri;
+	int use;
+	int end;
+} cache_struct;
+cache_struct cache[10];
 
 void doit(int connfd);
 void parse_uri(char *uri, char *hostname, char *path, int *port);
 void build_http_header(char *http_header, char *hostname, char *path, int port, rio_t *client_rio);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
+void *thread(void *varg);
+
 int main(int argc, char **argv)
 {
-	int listenfd, connfd;
+	int listenfd, *connfd;
 	char hostname[MAXLINE], port[MAXLINE];
 	socklen_t clientlen;
 	struct sockaddr_storage clientaddr;
+	pthread_t tid;
 
 	if (argc != 2)
 	{
 		fprintf(stderr, "usage :%s <port> \n", argv[0]);
 		exit(1);
 	}
-
+	Sem_init(&w, 0, 1);
+	Sem_init(&mutex, 0, 1);
+	Signal(SIGPIPE, SIG_IGN); // SIGPIPE 시그널 무시
 	listenfd = Open_listenfd(argv[1]);
 	while (1)
 	{
 		clientlen = sizeof(clientaddr);
-		connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
-
+		connfd = Malloc(sizeof(int));
+		*connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
 		Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
 		printf("Accepted connection from (%s %s).\n", hostname, port);
-		doit(connfd);
-		Close(connfd);
+		Pthread_create(&tid, NULL, thread, connfd);
+		// doit(connfd);
+		// Close(connfd);
 	}
 	return 0;
+}
+// thread 루틴 함수
+void *thread(void *varg)
+{
+	int connfd = *((int *)varg);
+	Pthread_detach(Pthread_self());
+	Free(varg);
+	doit(connfd);
+	Close(connfd);
+	return NULL;
 }
 
 // 클라이언트 HTTP 트랜잭션을 처리하는 함수
@@ -69,24 +94,25 @@ void doit(int connfd)
 	printf("parsed hostname: %s\n", hostname);
 	printf("parsed port: %d\n", port);
 	printf("parsed path: %s\n", path);
-
 	// end sever에 보낼 http_header를 만든다.
 	build_http_header(http_header, hostname, path, port, &rio);
 
-	sprintf(portStr, "%d", port);					 // port 타입을 string으로
-	end_serverfd = Open_clientfd(hostname, portStr); // end server와 연결
+	sprintf(portStr, "%d", port); // port 타입을 string으로
+	if (portStr != NULL)
+		end_serverfd = Open_clientfd(hostname, portStr); // end server와 연결
+	else
+		end_serverfd = Open_clientfd(hostname, "80");
 	// end server와 연결 실패시
 	if (end_serverfd < 0)
 	{
 		printf("connection failed\n");
 		return;
 	}
-
-	Rio_readinitb(&server_rio, end_serverfd);
 	Rio_writen(end_serverfd, http_header, strlen(http_header)); // end server로 http_header 전송
 
 	// end server로부터 받은 후 다시 client에 전송한다.
 	size_t n;
+	Rio_readinitb(&server_rio, end_serverfd);
 	while ((n = Rio_readlineb(&server_rio, buf, MAXLINE)) != 0)
 	{
 		printf("proxy received %d bytes,then send\n", n);
